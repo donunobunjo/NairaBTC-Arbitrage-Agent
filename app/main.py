@@ -1,10 +1,46 @@
+from slowapi import Limiter
 
+
+import secrets
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Query
+# from fastapi import Depends, FastAPI, Header, HTTPException, Query
+
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app.agent.graph import agent_graph
 from app.paper_trading import ledger
+
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
+
+
+class APISettings(BaseSettings):
+    API_SECRET_KEY: str
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+
+settings = APISettings()
+
+
+async def verify_api_key(
+    x_api_key: str | None = Header(default=None),
+):
+    """Reject requests that do not provide the correct API key."""
+    if not x_api_key or not secrets.compare_digest(
+        x_api_key, settings.API_SECRET_KEY
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or missing API key.",
+        )
 
 
 @asynccontextmanager
@@ -13,6 +49,7 @@ async def lifespan(app: FastAPI):
     ledger.initialize_database()
     yield
 
+limiter = Limiter(key_func=get_remote_address)
 
 app = FastAPI(
     title="NairaBTC Agent API",
@@ -23,6 +60,13 @@ app = FastAPI(
     ),
     version="0.1.0",
     lifespan=lifespan,
+)
+
+
+app.state.limiter = limiter
+app.add_exception_handler(
+    RateLimitExceeded,
+    _rate_limit_exceeded_handler,
 )
 
 
@@ -46,8 +90,9 @@ async def health():
     }
 
 
-@app.post("/scan")
-async def run_scan():
+@app.post("/scan", dependencies=[Depends(verify_api_key)])
+@limiter.limit("5/minute")
+async def run_scan(request: Request):
     """Fetch market data, analyze arbitrage, explain, and save results."""
     try:
         result = await agent_graph.ainvoke({})
@@ -83,25 +128,21 @@ async def run_scan():
     except HTTPException:
         raise
     except Exception as exc:
+        # Log the full exception privately in production.
         raise HTTPException(
             status_code=500,
-            detail=f"Scan failed: {exc}",
+            detail="Scan failed.",
         ) from exc
 
 
-@app.get("/scans")
+@app.get("/scans", dependencies=[Depends(verify_api_key)])
 async def recent_scans(
     limit: int = Query(default=10, ge=1, le=100),
 ):
     """Return recent saved scan records."""
     try:
         records = ledger.get_recent_records(limit=limit)
-
-        return {
-            "count": len(records),
-            "records": records,
-        }
-
+        return {"count": len(records), "records": records}
     except Exception as exc:
         raise HTTPException(
             status_code=500,
@@ -109,12 +150,11 @@ async def recent_scans(
         ) from exc
 
 
-@app.get("/portfolio")
+@app.get("/portfolio", dependencies=[Depends(verify_api_key)])
 async def portfolio():
     """Return the virtual portfolio balance."""
     try:
         return ledger.get_portfolio()
-
     except Exception as exc:
         raise HTTPException(
             status_code=500,
