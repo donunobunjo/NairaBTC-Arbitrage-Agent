@@ -94,9 +94,8 @@ def calculate_direction(
     sell_fee = sell_proceeds * fee_rate
 
     gross_profit = (
-        sell_proceeds
-        - effective_buy_price * trade_size_btc
-    )
+        sell_quote.bid - buy_quote.ask
+    ) * trade_size_btc
 
     estimated_slippage = (
         (effective_buy_price - buy_quote.ask)
