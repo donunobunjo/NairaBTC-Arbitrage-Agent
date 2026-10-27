@@ -181,3 +181,91 @@ def test_production_scan_rate_limit(monkeypatch):
         for response in responses[:5]
     )
     assert responses[5].status_code == 429
+
+
+
+
+
+
+def test_health_endpoint_returns_503_when_database_fails(monkeypatch):
+    import app.main as main_module
+
+    def failing_database_check():
+        raise RuntimeError("Simulated database failure")
+
+    monkeypatch.setattr(
+        main_module.ledger,
+        "get_portfolio",
+        failing_database_check,
+    )
+
+    with TestClient(main_module.app) as client:
+        response = client.get("/health")
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == (
+        "Service or database is unavailable."
+    )
+
+
+def test_health_endpoint_reports_database_available():
+    with TestClient(app) as client:
+        response = client.get("/health")
+
+    assert response.status_code == 200
+    assert response.json()["database"] == "available"
+
+
+def test_scan_reports_partial_save_failure(monkeypatch):
+    from decimal import Decimal
+    from types import SimpleNamespace
+
+    import app.main as main_module
+
+    fake_result = SimpleNamespace(
+        buy_exchange="Binance",
+        sell_exchange="OKX",
+        trade_size_btc=Decimal("0.001"),
+        buy_price=Decimal("90000"),
+        sell_price=Decimal("90200"),
+        gross_profit=Decimal("0.20"),
+        net_profit=Decimal("0.10"),
+        net_return_pct=Decimal("0.11"),
+        eligible=True,
+        reason="Net profit exceeds the configured threshold.",
+    )
+
+    class FakeGraph:
+        async def ainvoke(self, state):
+            return {
+                "quotes": [object(), object()],
+                "results": [fake_result],
+                "explanations": ["Estimated profit is positive."],
+                "saved_records": 0,
+                "save_errors": [
+                    "Failed to save Binance -> OKX."
+                ],
+            }
+
+    monkeypatch.setattr(
+        main_module,
+        "agent_graph",
+        FakeGraph(),
+    )
+
+    # Isolate this test from the production endpoint's rate limit.
+    main_module.app.state.limiter.reset()
+
+    with TestClient(main_module.app) as client:
+        response = client.post(
+            "/scan",
+            headers=AUTH_HEADERS,
+        )
+
+    assert response.status_code == 200
+
+    data = response.json()
+    assert data["status"] == "completed_with_warnings"
+    assert data["records_saved"] == 0
+    assert data["save_errors_count"] == 1
+    assert data["save_warnings"]

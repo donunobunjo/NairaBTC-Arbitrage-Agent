@@ -6,28 +6,38 @@ from langgraph.graph import StateGraph, START, END
 
 from app.market_data.models import MarketQuote
 from app.market_data.exchanges import fetch_all_quotes
-from app.arbitrage.calculator import compare_exchanges
-from app.arbitrage.calculator import ArbitrageResult
+from app.arbitrage.calculator import (
+    ArbitrageResult,
+    compare_exchanges,
+)
 from app.paper_trading import ledger
 from app.agent.llm import explain_scan
 
-# 1. Define the information passed between graph nodes.
+
+# 1. Define the state shared between graph nodes.
 class AgentState(TypedDict, total=False):
     quotes: list[MarketQuote]
     results: list[ArbitrageResult]
     explanations: list[str]
     saved_records: int
     error: str
+    save_errors: list[str]
 
 
-# 2. Node: fetch prices from the exchanges.
+# 2. Fetch market prices from the exchanges.
 async def fetch_market_data(state: AgentState) -> dict:
-    print("\n[1/3] Fetching market quotes...")
+    print("\n[1/4] Fetching market quotes...")
 
     try:
         quotes = await fetch_all_quotes()
 
         print(f"Received {len(quotes)} usable quote(s).")
+
+        for quote in quotes:
+            print(
+                f"{quote.exchange}: "
+                f"bid={quote.bid}, ask={quote.ask}"
+            )
 
         if len(quotes) < 2:
             return {
@@ -38,32 +48,27 @@ async def fetch_market_data(state: AgentState) -> dict:
                 ),
             }
 
-        for quote in quotes:
-            print(
-                f"{quote.exchange}: "
-                f"bid={quote.bid}, ask={quote.ask}"
-            )
+        return {"quotes": quotes, "error": ""}
 
-        return {"quotes": quotes}
-
-    except Exception as exc:
+    except Exception:
+        # Avoid exposing internal exception details in API responses.
         return {
             "quotes": [],
-            "error": f"Market data collection failed: {exc}",
+            "error": "Market data collection failed.",
         }
 
 
-# 3. Node: calculate arbitrage in both directions.
+# 3. Calculate arbitrage using deterministic Python logic.
 def analyze_arbitrage(state: AgentState) -> dict:
-    print("\n[2/3] Analyzing arbitrage opportunities...")
-
-    if state.get("error"):
-        return {"results": []}
+    print("\n[2/4] Analyzing arbitrage opportunities...")
 
     quotes = state.get("quotes", [])
 
     if len(quotes) < 2:
-        return {"results": []}
+        return {
+            "results": [],
+            "error": "Insufficient quotes for arbitrage analysis.",
+        }
 
     try:
         # Compare the first two available exchange quotes.
@@ -85,19 +90,18 @@ def analyze_arbitrage(state: AgentState) -> dict:
                 f"eligible={result.eligible}"
             )
 
-        return {"results": results}
+        return {"results": results, "error": ""}
 
-    except Exception as exc:
+    except Exception:
         return {
             "results": [],
-            "error": f"Arbitrage analysis failed: {exc}",
+            "error": "Arbitrage analysis failed.",
         }
 
 
-
+# 4. Explain results without allowing the LLM to decide eligibility.
 def explain_arbitrage_results(state: AgentState) -> dict:
-    """Explain calculated results without changing financial decisions."""
-    print("\nExplaining scan results with Groq...")
+    print("\n[3/4] Explaining scan results with Groq...")
 
     explanations = []
 
@@ -111,7 +115,7 @@ def explain_arbitrage_results(state: AgentState) -> dict:
                 reason=result.reason,
             )
         except Exception as exc:
-            # The scanner must remain useful if the LLM is unavailable.
+            # Continue scanning even if the LLM is unavailable.
             explanation = (
                 "LLM explanation unavailable. "
                 f"Python decision: "
@@ -121,32 +125,46 @@ def explain_arbitrage_results(state: AgentState) -> dict:
             print(f"Groq explanation failed: {exc}")
 
         explanations.append(explanation)
+
         print(f"\n{result.buy_exchange} -> {result.sell_exchange}")
         print(explanation)
 
     return {"explanations": explanations}
 
 
-
-# 4. Node: save every calculated opportunity.
+# 5. Save results and report individual database failures.
 def save_scan_results(state: AgentState) -> dict:
-    print("\n[3/3] Saving scan results...")
+    print("\n[4/4] Saving scan results...")
 
-    results = state.get("results", [])
     saved_records = 0
+    save_errors = []
 
-    for result in results:
-        ledger.record_scan(result)
-        saved_records += 1
+    for result in state.get("results", []):
+        try:
+            ledger.record_scan(result)
+            saved_records += 1
+        except Exception as exc:
+            # Don't let one failed record prevent attempts to save others.
+            message = (
+                f"Failed to save {result.buy_exchange} -> "
+                f"{result.sell_exchange}."
+            )
+            save_errors.append(message)
+            print(f"{message} Error: {exc}")
 
     print(f"Saved {saved_records} scan record(s).")
 
-    return {"saved_records": saved_records}
+    if save_errors:
+        print(f"Encountered {len(save_errors)} save error(s).")
+
+    return {
+        "saved_records": saved_records,
+        "save_errors": save_errors,
+    }
 
 
-
+# 6. Route failed data collection or analysis to the end.
 def route_after_fetch(state: AgentState) -> str:
-    """Stop safely if market data collection failed."""
     if state.get("error"):
         return "stop"
 
@@ -156,22 +174,26 @@ def route_after_fetch(state: AgentState) -> str:
     return "analyze"
 
 
-# 5. Build the LangGraph workflow.
+def route_after_analysis(state: AgentState) -> str:
+    if state.get("error"):
+        return "stop"
 
-# 5. Build the LangGraph workflow.
+    return "explain"
+
+
+# 7. Build the LangGraph workflow.
 builder = StateGraph(AgentState)
 
 builder.add_node("fetch_market_data", fetch_market_data)
 builder.add_node("analyze_arbitrage", analyze_arbitrage)
-builder.add_node("save_scan_results", save_scan_results)
 builder.add_node(
     "explain_arbitrage_results",
     explain_arbitrage_results,
 )
+builder.add_node("save_scan_results", save_scan_results)
 
 builder.add_edge(START, "fetch_market_data")
 
-# Choose the next node based on the market-data result.
 builder.add_conditional_edges(
     "fetch_market_data",
     route_after_fetch,
@@ -181,14 +203,20 @@ builder.add_conditional_edges(
     },
 )
 
-builder.add_edge(
+builder.add_conditional_edges(
     "analyze_arbitrage",
-    "explain_arbitrage_results",
+    route_after_analysis,
+    {
+        "explain": "explain_arbitrage_results",
+        "stop": END,
+    },
 )
+
 builder.add_edge(
     "explain_arbitrage_results",
     "save_scan_results",
 )
-builder.add_edge("save_scan_results", END) 
+builder.add_edge("save_scan_results", END)
+
 # Compile the graph.
 agent_graph = builder.compile()
